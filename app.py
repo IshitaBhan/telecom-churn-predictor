@@ -1,3 +1,8 @@
+import os
+import streamlit as st
+
+# Set page config first
+st.set_page_config(page_title="Churn Predictor", page_icon="📊", layout="wide")
 import pandas as pd
 import numpy as np
 import streamlit as st
