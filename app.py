@@ -5,590 +5,722 @@ import plotly.express as px
 import plotly.graph_objects as go
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, accuracy_score
-import seaborn as sns
-import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, accuracy_score, precision_score, recall_score
+from sklearn.impute import SimpleImputer
 import warnings
 warnings.filterwarnings('ignore')
 
-class AdvancedChurnPredictor:
+class GenericChurnPredictor:
+    """
+    Generic Customer Churn Predictor for ANY Business
+    Works with any dataset - just needs a 'churn' column (or similar)
+    """
     def __init__(self):
         self.models = {}
         self.scaler = StandardScaler()
         self.label_encoders = {}
+        self.imputer_numeric = SimpleImputer(strategy='median')
+        self.imputer_categorical = SimpleImputer(strategy='most_frequent')
         self.best_model = None
+        self.best_model_name = None
         self.is_trained = False
+        self.feature_columns = []
+        self.target_column = None
+        self.training_data = None
+        self.categorical_columns = []
+        self.numerical_columns = []
         
-    def create_sample_data(self, n_samples=1000):
-        """Create realistic sample telecom data"""
-        np.random.seed(42)
+    def detect_target_column(self, df):
+        """Automatically detect the churn/target column"""
+        possible_targets = ['churn', 'churned', 'is_churn', 'customer_churn', 'attrition', 
+                           'left', 'cancelled', 'canceled', 'retention', 'stayed', 'active']
         
-        # Generate realistic customer data
-        data = {
-            'CustomerID': [f'CUST_{i:05d}' for i in range(n_samples)],
-            'Gender': np.random.choice(['Male', 'Female'], n_samples),
-            'Age': np.random.normal(45, 15, n_samples).astype(int),
-            'Tenure_Months': np.random.exponential(24, n_samples).astype(int),
-            'Monthly_Charges': np.random.normal(65, 20, n_samples),
-            'Total_Charges': None,  # Will calculate
-            'Contract_Type': np.random.choice(['Month-to-month', 'One year', 'Two year'], 
-                                            n_samples, p=[0.5, 0.3, 0.2]),
-            'Payment_Method': np.random.choice(['Electronic check', 'Mailed check', 
-                                              'Bank transfer', 'Credit card'], n_samples),
-            'Internet_Service': np.random.choice(['DSL', 'Fiber optic', 'No'], 
-                                               n_samples, p=[0.4, 0.4, 0.2]),
-            'Online_Security': np.random.choice(['Yes', 'No', 'No internet service'], n_samples),
-            'Tech_Support': np.random.choice(['Yes', 'No', 'No internet service'], n_samples),
-            'Streaming_TV': np.random.choice(['Yes', 'No', 'No internet service'], n_samples),
-            'Multiple_Lines': np.random.choice(['Yes', 'No', 'No phone service'], n_samples),
-        }
+        # Check for exact matches (case insensitive)
+        for col in df.columns:
+            if col.lower() in possible_targets:
+                return col
         
-        df = pd.DataFrame(data)
+        # Check for partial matches
+        for col in df.columns:
+            for target in possible_targets:
+                if target in col.lower():
+                    return col
         
-        # Calculate total charges
-        df['Total_Charges'] = df['Monthly_Charges'] * df['Tenure_Months']
+        # Check for binary columns (0/1 or Yes/No)
+        for col in df.columns:
+            if df[col].dtype == 'object':
+                unique_vals = df[col].unique()
+                if len(unique_vals) == 2:
+                    if set(map(str, unique_vals)).issubset({'0', '1', 'Yes', 'No', 'True', 'False', 'Y', 'N'}):
+                        return col
+            elif df[col].dtype in ['int64', 'float64']:
+                unique_vals = df[col].unique()
+                if len(unique_vals) == 2 and set(unique_vals).issubset({0, 1}):
+                    return col
         
-        # Create churn based on realistic patterns
-        churn_probability = (
-            0.05 +  # Base rate
-            (df['Contract_Type'] == 'Month-to-month') * 0.3 +
-            (df['Payment_Method'] == 'Electronic check') * 0.2 +
-            (df['Internet_Service'] == 'Fiber optic') * 0.15 +
-            (df['Online_Security'] == 'No') * 0.1 +
-            (df['Tech_Support'] == 'No') * 0.1 +
-            (df['Monthly_Charges'] > 80) * 0.15 +
-            (df['Tenure_Months'] < 12) * 0.25
-        )
-        
-        df['Churn'] = np.random.binomial(1, churn_probability)
-        df['Churn'] = df['Churn'].map({1: 'Yes', 0: 'No'})
-        
-        return df
+        return None
     
-    def preprocess_data(self, df):
-        """Advanced data preprocessing"""
+    def prepare_data(self, df, target_column=None):
+        """Prepare any dataset for churn prediction"""
+        if target_column is None:
+            target_column = self.detect_target_column(df)
+            
+        if target_column is None:
+            raise ValueError("Could not detect target column. Please specify the column name that indicates churn.")
+        
+        self.target_column = target_column
+        
+        # Make a copy
         df_processed = df.copy()
         
-        # Ensure required columns exist
-        required_columns = ['Monthly_Charges', 'Tenure_Months']
-        for col in required_columns:
-            if col not in df_processed.columns:
-                if col == 'Monthly_Charges':
-                    df_processed[col] = 65.0
-                elif col == 'Tenure_Months':
-                    df_processed[col] = 24
-        
-        # Handle Total_Charges
-        if 'Total_Charges' not in df_processed.columns:
-            df_processed['Total_Charges'] = df_processed['Monthly_Charges'] * df_processed['Tenure_Months']
+        # Convert target to binary (0/1)
+        if df_processed[target_column].dtype == 'object':
+            # Handle text values
+            positive_values = ['yes', 'y', 'true', '1', 'churn', 'churned', 'left', 'cancelled', 'canceled']
+            df_processed[target_column] = df_processed[target_column].astype(str).str.lower().isin(positive_values).astype(int)
         else:
-            df_processed['Total_Charges'] = pd.to_numeric(df_processed['Total_Charges'], errors='coerce')
-            df_processed['Total_Charges'].fillna(
-                df_processed['Monthly_Charges'] * df_processed['Tenure_Months'], inplace=True
-            )
+            # Handle numeric values
+            df_processed[target_column] = (df_processed[target_column] > 0).astype(int)
         
-        # Feature engineering
-        df_processed['Tenure_Years'] = df_processed['Tenure_Months'] / 12
-        df_processed['Charges_Per_Tenure'] = df_processed['Total_Charges'] / (df_processed['Tenure_Months'] + 1)
-        df_processed['High_Value_Customer'] = (df_processed['Monthly_Charges'] > df_processed['Monthly_Charges'].quantile(0.75)).astype(int)
+        # Separate features and target
+        X = df_processed.drop(columns=[target_column])
+        y = df_processed[target_column]
+        
+        # Remove ID columns (typically first column or columns with 'id' in name)
+        id_columns = []
+        for col in X.columns:
+            if ('id' in col.lower() or 
+                col.lower().startswith('customer') and 'id' in col.lower() or
+                X[col].dtype == 'object' and X[col].nunique() == len(X)):
+                id_columns.append(col)
+        
+        if id_columns:
+            X = X.drop(columns=id_columns)
+            st.info(f"Removed ID columns: {id_columns}")
+        
+        # Identify column types
+        self.numerical_columns = X.select_dtypes(include=[np.number]).columns.tolist()
+        self.categorical_columns = X.select_dtypes(include=['object']).columns.tolist()
+        
+        return X, y
+    
+    def preprocess_features(self, X, is_training=True):
+        """Preprocess features for any dataset"""
+        X_processed = X.copy()
+        
+        # Handle missing values
+        if len(self.numerical_columns) > 0:
+            if is_training:
+                X_processed[self.numerical_columns] = self.imputer_numeric.fit_transform(X_processed[self.numerical_columns])
+            else:
+                X_processed[self.numerical_columns] = self.imputer_numeric.transform(X_processed[self.numerical_columns])
+        
+        if len(self.categorical_columns) > 0:
+            if is_training:
+                X_processed[self.categorical_columns] = self.imputer_categorical.fit_transform(X_processed[self.categorical_columns])
+            else:
+                X_processed[self.categorical_columns] = self.imputer_categorical.transform(X_processed[self.categorical_columns])
         
         # Encode categorical variables
-        categorical_columns = df_processed.select_dtypes(include=['object']).columns
-        categorical_columns = [col for col in categorical_columns if col not in ['CustomerID', 'Churn']]
-        
-        for col in categorical_columns:
-            if col not in self.label_encoders:
-                self.label_encoders[col] = LabelEncoder()
-                df_processed[col] = self.label_encoders[col].fit_transform(df_processed[col].astype(str))
-            else:
-                try:
-                    df_processed[col] = self.label_encoders[col].transform(df_processed[col].astype(str))
-                except ValueError:
+        for col in self.categorical_columns:
+            if col in X_processed.columns:
+                if is_training:
                     self.label_encoders[col] = LabelEncoder()
-                    df_processed[col] = self.label_encoders[col].fit_transform(df_processed[col].astype(str))
-        
-        return df_processed
-    
-    def train_models(self, df):
-        """Train multiple advanced models"""
-        df_processed = self.preprocess_data(df)
-        
-        # Prepare features and target
-        columns_to_drop = []
-        if 'CustomerID' in df_processed.columns:
-            columns_to_drop.append('CustomerID')
-        if 'Churn' in df_processed.columns:
-            columns_to_drop.append('Churn')
-            y = LabelEncoder().fit_transform(df_processed['Churn'])
-        else:
-            # Create fake target for demo
-            y = np.random.choice([0, 1], size=len(df_processed), p=[0.7, 0.3])
-        
-        X = df_processed.drop(columns_to_drop, axis=1) if columns_to_drop else df_processed
-        
-        # Ensure we have numeric data only
-        X = X.select_dtypes(include=[np.number])
-        
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-        
-        # Scale features
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
-        
-        # Define models
-        models = {
-            'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42, max_depth=10),
-            'Gradient Boosting': GradientBoostingClassifier(random_state=42, n_estimators=100),
-            'Logistic Regression': LogisticRegression(random_state=42, max_iter=1000)
-        }
-        
-        results = {}
-        
-        for name, model in models.items():
-            try:
-                if name == 'Logistic Regression':
-                    model.fit(X_train_scaled, y_train)
-                    y_pred = model.predict(X_test_scaled)
-                    y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+                    X_processed[col] = self.label_encoders[col].fit_transform(X_processed[col].astype(str))
                 else:
-                    model.fit(X_train, y_train)
-                    y_pred = model.predict(X_test)
-                    y_pred_proba = model.predict_proba(X_test)[:, 1]
-                
-                accuracy = accuracy_score(y_test, y_pred)
-                auc_score = roc_auc_score(y_test, y_pred_proba)
-                
-                results[name] = {
-                    'model': model,
-                    'accuracy': accuracy,
-                    'auc_score': auc_score,
-                    'y_test': y_test,
-                    'y_pred': y_pred,
-                    'y_pred_proba': y_pred_proba
-                }
-                
-                self.models[name] = model
-            except Exception as e:
-                st.warning(f"Error training {name}: {str(e)}")
-                continue
+                    if col in self.label_encoders:
+                        # Handle unseen categories
+                        try:
+                            X_processed[col] = self.label_encoders[col].transform(X_processed[col].astype(str))
+                        except ValueError:
+                            # Replace unseen categories with most frequent
+                            most_frequent = self.label_encoders[col].classes_[0]
+                            X_processed[col] = X_processed[col].astype(str).apply(
+                                lambda x: x if x in self.label_encoders[col].classes_ else most_frequent
+                            )
+                            X_processed[col] = self.label_encoders[col].transform(X_processed[col])
         
-        if results:
-            # Select best model
-            best_model_name = max(results.keys(), key=lambda x: results[x]['auc_score'])
-            self.best_model = results[best_model_name]['model']
-            self.best_model_name = best_model_name
-            self.is_trained = True
-        
-        return results
+        return X_processed
     
-    def predict_single_customer(self, customer_data, df_original):
-        """Predict churn for a single customer"""
-        if not self.is_trained:
-            return 0.5  # Default prediction
-            
+    def train_models(self, df, target_column=None):
+        """Train ML models on any churn dataset"""
         try:
-            # Create a simple prediction based on risk factors
-            risk_score = 0.0
+            # Prepare data
+            X, y = self.prepare_data(df, target_column)
             
-            # Contract type risk
-            if customer_data.get('Contract_Type') == 'Month-to-month':
-                risk_score += 0.3
-            elif customer_data.get('Contract_Type') == 'One year':
-                risk_score += 0.1
+            # Store training data
+            self.training_data = df.copy()
             
-            # Payment method risk
-            if customer_data.get('Payment_Method') == 'Electronic check':
-                risk_score += 0.25
-            elif customer_data.get('Payment_Method') == 'Mailed check':
-                risk_score += 0.15
+            # Preprocess features
+            X_processed = self.preprocess_features(X, is_training=True)
             
-            # Internet service risk
-            if customer_data.get('Internet_Service') == 'Fiber optic':
-                risk_score += 0.2
-            elif customer_data.get('Internet_Service') == 'DSL':
-                risk_score += 0.1
+            # Store feature columns
+            self.feature_columns = X_processed.columns.tolist()
             
-            # Support services risk
-            if customer_data.get('Tech_Support') == 'No':
-                risk_score += 0.15
-            if customer_data.get('Online_Security') == 'No':
-                risk_score += 0.1
+            # Check class distribution
+            class_counts = y.value_counts()
+            churn_rate = class_counts.get(1, 0) / len(y)
             
-            # Tenure risk (shorter tenure = higher risk)
-            tenure = customer_data.get('Tenure_Months', 24)
-            if tenure < 12:
-                risk_score += 0.2
-            elif tenure < 24:
-                risk_score += 0.1
+            st.write(f"📊 **Dataset Analysis:**")
+            st.write(f"- Total customers: {len(y):,}")
+            st.write(f"- Churned customers: {class_counts.get(1, 0):,}")
+            st.write(f"- Retained customers: {class_counts.get(0, 0):,}")
+            st.write(f"- Churn rate: {churn_rate:.1%}")
+            st.write(f"- Features: {len(self.feature_columns)}")
             
-            # Monthly charges risk (very high or very low charges)
-            charges = customer_data.get('Monthly_Charges', 65)
-            if charges > 80:
-                risk_score += 0.15
-            elif charges < 30:
-                risk_score += 0.1
+            # Split data
+            X_train, X_test, y_train, y_test = train_test_split(
+                X_processed, y, test_size=0.2, random_state=42, stratify=y
+            )
             
-            # Cap the risk score between 0.05 and 0.95
-            risk_score = max(0.05, min(0.95, risk_score))
+            # Scale features
+            X_train_scaled = self.scaler.fit_transform(X_train)
+            X_test_scaled = self.scaler.transform(X_test)
             
-            return risk_score
+            # Define models
+            models = {
+                'Random Forest': RandomForestClassifier(
+                    n_estimators=200, 
+                    random_state=42, 
+                    max_depth=15,
+                    min_samples_split=5,
+                    min_samples_leaf=2,
+                    class_weight='balanced'
+                ),
+                'Gradient Boosting': GradientBoostingClassifier(
+                    random_state=42, 
+                    n_estimators=150,
+                    learning_rate=0.1,
+                    max_depth=8,
+                    min_samples_split=5
+                ),
+                'Logistic Regression': LogisticRegression(
+                    random_state=42, 
+                    max_iter=1000,
+                    class_weight='balanced'
+                )
+            }
+            
+            results = {}
+            
+            for name, model in models.items():
+                try:
+                    st.write(f"🔄 Training {name}...")
+                    
+                    # Train model
+                    if name == 'Logistic Regression':
+                        model.fit(X_train_scaled, y_train)
+                        y_pred = model.predict(X_test_scaled)
+                        y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]
+                        cv_scores = cross_val_score(model, X_train_scaled, y_train, cv=5, scoring='roc_auc')
+                    else:
+                        model.fit(X_train, y_train)
+                        y_pred = model.predict(X_test)
+                        y_pred_proba = model.predict_proba(X_test)[:, 1]
+                        cv_scores = cross_val_score(model, X_train, y_train, cv=5, scoring='roc_auc')
+                    
+                    # Calculate metrics
+                    accuracy = accuracy_score(y_test, y_pred)
+                    precision = precision_score(y_test, y_pred, zero_division=0)
+                    recall = recall_score(y_test, y_pred, zero_division=0)
+                    auc_score = roc_auc_score(y_test, y_pred_proba)
+                    cv_mean = cv_scores.mean()
+                    cv_std = cv_scores.std()
+                    
+                    results[name] = {
+                        'model': model,
+                        'accuracy': accuracy,
+                        'precision': precision,
+                        'recall': recall,
+                        'auc_score': auc_score,
+                        'cv_score': cv_mean,
+                        'cv_std': cv_std,
+                        'y_test': y_test,
+                        'y_pred': y_pred,
+                        'y_pred_proba': y_pred_proba
+                    }
+                    
+                    self.models[name] = model
+                    
+                    st.write(f"✅ {name} - AUC: {auc_score:.3f}, Accuracy: {accuracy:.3f}, CV: {cv_mean:.3f} ± {cv_std:.3f}")
+                    
+                except Exception as e:
+                    st.warning(f"❌ Error training {name}: {str(e)}")
+                    continue
+            
+            if results:
+                # Select best model based on AUC score
+                best_model_name = max(results.keys(), key=lambda x: results[x]['auc_score'])
+                self.best_model = results[best_model_name]['model']
+                self.best_model_name = best_model_name
+                self.is_trained = True
+                
+                st.success(f"🏆 **Best Model:** {best_model_name} (AUC: {results[best_model_name]['auc_score']:.3f})")
+            
+            return results
             
         except Exception as e:
-            st.error(f"Prediction error: {str(e)}")
-            return 0.5  # Default fallback
+            st.error(f"❌ Training failed: {str(e)}")
+            return {}
+    
+    def predict_churn(self, customer_data):
+        """Predict churn for new customer data"""
+        if not self.is_trained:
+            st.error("❌ Model not trained yet!")
+            return None
+            
+        try:
+            # Convert to DataFrame if dict
+            if isinstance(customer_data, dict):
+                customer_df = pd.DataFrame([customer_data])
+            else:
+                customer_df = customer_data.copy()
+            
+            # Add missing columns with default values
+            for col in self.feature_columns:
+                if col not in customer_df.columns:
+                    if col in self.numerical_columns:
+                        customer_df[col] = 0
+                    else:
+                        customer_df[col] = 'Unknown'
+            
+            # Select and order columns
+            customer_df = customer_df[self.feature_columns]
+            
+            # Preprocess
+            customer_processed = self.preprocess_features(customer_df, is_training=False)
+            
+            # Make prediction
+            if self.best_model_name == 'Logistic Regression':
+                customer_scaled = self.scaler.transform(customer_processed)
+                churn_probability = self.best_model.predict_proba(customer_scaled)[0, 1]
+            else:
+                churn_probability = self.best_model.predict_proba(customer_processed)[0, 1]
+            
+            return churn_probability
+            
+        except Exception as e:
+            st.error(f"❌ Prediction failed: {str(e)}")
+            return None
+    
+    def get_feature_importance(self):
+        """Get feature importance from trained model"""
+        if not self.is_trained or not hasattr(self.best_model, 'feature_importances_'):
+            return None
+            
+        importance_df = pd.DataFrame({
+            'feature': self.feature_columns,
+            'importance': self.best_model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        return importance_df
 
-# Streamlit App
 def main():
-    st.set_page_config(page_title="AI Churn Predictor", page_icon="🔮", layout="wide")
+    st.set_page_config(page_title="Generic Churn Predictor", page_icon="📊", layout="wide")
     
-    # Custom CSS for better styling
     st.markdown("""
-    <style>
-    .main-header {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-        padding: 2rem;
-        border-radius: 10px;
-        text-align: center;
-        color: white;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background: #f8f9fa;
-        padding: 1rem;
-        border-radius: 8px;
-        border-left: 4px solid #667eea;
-    }
-    </style>
-    """, unsafe_allow_html=True)
+    # 📊 Universal Customer Churn Predictor
     
-    # Header
-    st.markdown("""
-    <div class="main-header">
-        <h1>🔮 AI-Powered Telecom Churn Prediction System</h1>
-        <p>Advanced Machine Learning for Customer Retention • Built for Indian Telecom Industry</p>
-        <p><strong>95% Accuracy • ₹50+ Crores Annual Savings • Real-time Predictions</strong></p>
-    </div>
-    """, unsafe_allow_html=True)
+    **Upload ANY business dataset and predict customer churn!**
+    
+    This system works with data from:
+    - 🏦 Banks & Financial Services
+    - 📱 Telecom & SaaS Companies  
+    - 🛒 E-commerce & Retail
+    - 🏥 Healthcare & Insurance
+    - 🎓 Education & Subscriptions
+    - 🏨 Hotels & Services
+    
+    Just upload your CSV with customer data and a churn indicator column!
+    """)
     
     # Initialize predictor
     if 'predictor' not in st.session_state:
-        st.session_state.predictor = AdvancedChurnPredictor()
+        st.session_state.predictor = GenericChurnPredictor()
     
     # Sidebar
     st.sidebar.title("🎯 Navigation")
-    page = st.sidebar.selectbox("Choose Analysis", 
-                               ["📊 Model Training & Demo", "🎯 Customer Risk Assessment", "📈 Business Intelligence"])
+    page = st.sidebar.selectbox("Choose Option", 
+                               ["📤 Upload & Train", "🔮 Predict Churn", "📊 Model Analysis", "💡 How to Use"])
     
-    if page == "📊 Model Training & Demo":
-        st.header("🚀 Advanced ML Model Training")
+    if page == "📤 Upload & Train":
+        st.header("📤 Upload Your Dataset & Train ML Models")
         
-        col1, col2 = st.columns([1, 1])
+        st.info("""
+        **📋 Data Requirements:**
+        - CSV file with customer data
+        - One column indicating churn (Yes/No, 1/0, True/False, etc.)
+        - Customer features (age, tenure, spending, etc.)
         
-        with col1:
-            st.subheader("📁 Data Source")
-            data_option = st.radio("Choose data source:", 
-                                 ["🎯 Use Demo Dataset (Recommended)", "📤 Upload Your Data"])
+        **🔍 The system will automatically:**
+        - Detect your churn column
+        - Handle missing values
+        - Encode categorical variables
+        - Train multiple ML models
+        - Select the best performer
+        """)
         
-        with col2:
-            st.subheader("⚙️ Model Configuration")
-            st.info("Using ensemble of 3 advanced algorithms:\n• Random Forest\n• Gradient Boosting\n• Logistic Regression")
+        uploaded_file = st.file_uploader("Choose your CSV file", type="csv")
         
-        if data_option == "🎯 Use Demo Dataset (Recommended)":
-            if st.button("🚀 Generate Demo Data & Train Models"):
-                with st.spinner("🔄 Generating realistic telecom dataset..."):
-                    df = st.session_state.predictor.create_sample_data(1000)
-                    st.session_state.demo_data = df
+        if uploaded_file is not None:
+            try:
+                # Load data
+                df = pd.read_csv(uploaded_file)
                 
-                st.success("✅ Demo dataset created successfully!")
+                st.success(f"✅ **File loaded successfully!** ({len(df)} rows, {len(df.columns)} columns)")
                 
-                # Display dataset overview
-                st.subheader("📊 Dataset Overview")
-                col1, col2, col3, col4 = st.columns(4)
+                # Show data preview
+                st.subheader("🔍 Data Preview")
+                st.dataframe(df.head())
+                
+                # Show basic info
+                st.subheader("📊 Dataset Information")
+                col1, col2, col3 = st.columns(3)
                 
                 with col1:
-                    st.metric("Total Customers", len(df))
+                    st.metric("Total Rows", len(df))
                 with col2:
-                    churn_rate = (df['Churn'] == 'Yes').mean() * 100
-                    st.metric("Churn Rate", f"{churn_rate:.1f}%")
+                    st.metric("Total Columns", len(df.columns))
                 with col3:
-                    avg_tenure = df['Tenure_Months'].mean()
-                    st.metric("Avg Tenure", f"{avg_tenure:.1f} months")
-                with col4:
-                    avg_charges = df['Monthly_Charges'].mean()
-                    st.metric("Avg Monthly Charges", f"₹{avg_charges:.0f}")
+                    missing_pct = (df.isnull().sum().sum() / (len(df) * len(df.columns))) * 100
+                    st.metric("Missing Data", f"{missing_pct:.1f}%")
+                
+                # Let user select target column
+                st.subheader("🎯 Select Target Column")
+                
+                # Try to auto-detect
+                auto_detected = st.session_state.predictor.detect_target_column(df)
+                if auto_detected:
+                    st.success(f"✅ **Auto-detected churn column:** `{auto_detected}`")
+                    default_idx = list(df.columns).index(auto_detected)
+                else:
+                    st.warning("⚠️ Could not auto-detect churn column. Please select manually.")
+                    default_idx = 0
+                
+                target_column = st.selectbox(
+                    "Select the column that indicates customer churn:",
+                    options=df.columns.tolist(),
+                    index=default_idx
+                )
+                
+                # Show target distribution
+                if target_column:
+                    st.write(f"**Target column distribution:**")
+                    target_counts = df[target_column].value_counts()
+                    st.write(target_counts)
                 
                 # Train models
-                with st.spinner("🤖 Training advanced ML models..."):
-                    results = st.session_state.predictor.train_models(df)
-                    st.session_state.training_results = results
-                
-                st.success("🎉 Models trained successfully!")
-                
-                # Display model performance
-                st.subheader("🏆 Model Performance Comparison")
-                
-                performance_data = []
-                for model_name, result in results.items():
-                    performance_data.append({
-                        'Model': model_name,
-                        'Accuracy': f"{result['accuracy']:.1%}",
-                        'AUC Score': f"{result['auc_score']:.3f}",
-                        'Performance': result['auc_score']
-                    })
-                
-                perf_df = pd.DataFrame(performance_data)
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    fig = px.bar(perf_df, x='Model', y='Performance', 
-                               title="Model Performance (AUC Score)",
-                               color='Performance', 
-                               color_continuous_scale='viridis')
-                    fig.update_layout(showlegend=False)
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                with col2:
-                    st.dataframe(perf_df.drop('Performance', axis=1), use_container_width=True)
-                
-                # Feature importance
-                if hasattr(st.session_state.predictor.best_model, 'feature_importances_'):
-                    st.subheader("🎯 Key Factors Driving Churn")
+                if st.button("🚀 Train Machine Learning Models"):
+                    with st.spinner("🔄 Training models on your data..."):
+                        results = st.session_state.predictor.train_models(df, target_column)
+                        st.session_state.training_results = results
+                        st.session_state.uploaded_data = df
                     
-                    # Get feature names
-                    feature_names = ['Gender', 'Age', 'Tenure_Months', 'Monthly_Charges', 'Total_Charges',
-                                   'Contract_Type', 'Payment_Method', 'Internet_Service', 'Online_Security',
-                                   'Tech_Support', 'Streaming_TV', 'Multiple_Lines', 'Tenure_Years',
-                                   'Charges_Per_Tenure', 'High_Value_Customer']
+                    if results:
+                        st.success("🎉 **Models trained successfully!**")
+                        
+                        # Show results
+                        st.subheader("🏆 Model Performance")
+                        
+                        perf_data = []
+                        for name, result in results.items():
+                            perf_data.append({
+                                'Model': name,
+                                'AUC Score': f"{result['auc_score']:.3f}",
+                                'Accuracy': f"{result['accuracy']:.3f}",
+                                'Precision': f"{result['precision']:.3f}",
+                                'Recall': f"{result['recall']:.3f}",
+                                'CV Score': f"{result['cv_score']:.3f} ± {result['cv_std']:.3f}"
+                            })
+                        
+                        perf_df = pd.DataFrame(perf_data)
+                        st.dataframe(perf_df)
+                        
+                        # Feature importance
+                        importance_df = st.session_state.predictor.get_feature_importance()
+                        if importance_df is not None:
+                            st.subheader("🎯 Most Important Features")
+                            
+                            fig = px.bar(importance_df.head(10), 
+                                       x='importance', y='feature',
+                                       orientation='h', 
+                                       title="Top 10 Features for Churn Prediction")
+                            st.plotly_chart(fig, use_container_width=True)
                     
-                    importances = st.session_state.predictor.best_model.feature_importances_
-                    feature_imp_df = pd.DataFrame({
-                        'Feature': feature_names[:len(importances)],
-                        'Importance': importances
-                    }).sort_values('Importance', ascending=False).head(8)
-                    
-                    fig = px.bar(feature_imp_df, x='Importance', y='Feature', 
-                               orientation='h', title="Top 8 Churn Prediction Factors")
-                    st.plotly_chart(fig, use_container_width=True)
-                
-                # Business insights
-                st.subheader("💼 Business Impact Analysis")
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.markdown("### 📈 Revenue Protection")
-                    monthly_revenue_at_risk = len(df[df['Churn'] == 'Yes']) * df['Monthly_Charges'].mean()
-                    st.metric("Monthly Revenue at Risk", f"₹{monthly_revenue_at_risk:,.0f}")
-                    
-                with col2:
-                    st.markdown("### 🎯 Model Precision")
-                    best_accuracy = max([r['accuracy'] for r in results.values()])
-                    st.metric("Best Model Accuracy", f"{best_accuracy:.1%}")
-                    
-                with col3:
-                    st.markdown("### 💰 Potential Savings")
-                    annual_savings = monthly_revenue_at_risk * 12 * 0.75  # 75% prevention rate
-                    st.metric("Annual Savings Potential", f"₹{annual_savings:,.0f}")
-        
-        else:  # Upload your data
-            uploaded_file = st.file_uploader("Upload CSV file", type=['csv'])
-            if uploaded_file:
-                df = pd.read_csv(uploaded_file)
-                st.write("Data preview:", df.head())
-                
-                if st.button("Train Models on Your Data"):
-                    with st.spinner("Training models..."):
-                        results = st.session_state.predictor.train_models(df)
-                    st.success("Models trained on your data!")
+            except Exception as e:
+                st.error(f"❌ Error loading file: {str(e)}")
+                st.write("Please ensure your CSV file is properly formatted.")
     
-    elif page == "🎯 Customer Risk Assessment":
-        st.header("🎯 Individual Customer Churn Risk Assessment")
+    elif page == "🔮 Predict Churn":
+        st.header("🔮 Predict Customer Churn")
         
         if not st.session_state.predictor.is_trained:
-            st.warning("⚠️ Please train the models first in the 'Model Training & Demo' section.")
-            return
+            st.warning("⚠️ **Please upload data and train models first!**")
+            st.stop()
         
-        st.markdown("### Enter Customer Details for Real-time Risk Assessment")
+        st.info("**Enter customer information to predict churn probability using your trained ML model.**")
         
-        with st.form("customer_assessment"):
-            col1, col2 = st.columns(2)
+        # Dynamic form based on training data
+        if hasattr(st.session_state, 'uploaded_data'):
+            df = st.session_state.uploaded_data
             
-            with col1:
-                st.subheader("📝 Basic Information")
-                gender = st.selectbox("Gender", ["Male", "Female"])
-                age = st.slider("Age", 18, 80, 35)
-                tenure = st.slider("Tenure (Months)", 1, 72, 24)
-                monthly_charges = st.slider("Monthly Charges (₹)", 20, 150, 65)
-                
-            with col2:
-                st.subheader("📋 Service Details")
-                contract = st.selectbox("Contract Type", ["Month-to-month", "One year", "Two year"])
-                payment = st.selectbox("Payment Method", ["Electronic check", "Mailed check", "Bank transfer", "Credit card"])
-                internet = st.selectbox("Internet Service", ["DSL", "Fiber optic", "No"])
-                tech_support = st.selectbox("Tech Support", ["Yes", "No", "No internet service"])
-                online_security = st.selectbox("Online Security", ["Yes", "No", "No internet service"])
-                streaming_tv = st.selectbox("Streaming TV", ["Yes", "No", "No internet service"])
-                multiple_lines = st.selectbox("Multiple Lines", ["Yes", "No", "No phone service"])
+            st.subheader("📝 Customer Information")
             
-            submitted = st.form_submit_button("🔮 Assess Churn Risk")
+            # Create input form
+            customer_data = {}
             
-            if submitted:
-                customer_data = {
-                    'CustomerID': 'ASSESSMENT_001',
-                    'Gender': gender,
-                    'Age': age,
-                    'Tenure_Months': tenure,
-                    'Monthly_Charges': monthly_charges,
-                    'Total_Charges': monthly_charges * tenure,
-                    'Contract_Type': contract,
-                    'Payment_Method': payment,
-                    'Internet_Service': internet,
-                    'Online_Security': online_security,
-                    'Tech_Support': tech_support,
-                    'Streaming_TV': streaming_tv,
-                    'Multiple_Lines': multiple_lines
-                }
-                
-                # Debug info
-                st.write("🔍 **Debug Info:**")
-                st.write(f"- Is model trained: {st.session_state.predictor.is_trained}")
-                st.write(f"- Customer data created: ✅")
-                
-                # Get prediction
-                try:
-                    if 'demo_data' in st.session_state:
-                        churn_prob = st.session_state.predictor.predict_single_customer(customer_data, st.session_state.demo_data)
-                    else:
-                        # Create minimal demo data for prediction
-                        demo_df = st.session_state.predictor.create_sample_data(10)
-                        churn_prob = st.session_state.predictor.predict_single_customer(customer_data, demo_df)
+            # Get feature columns (excluding target)
+            feature_cols = [col for col in df.columns if col != st.session_state.predictor.target_column]
+            
+            # Create input fields
+            for col in feature_cols:
+                if col in st.session_state.predictor.numerical_columns:
+                    # Numerical input
+                    min_val = float(df[col].min())
+                    max_val = float(df[col].max())
+                    mean_val = float(df[col].mean())
                     
-                    st.write(f"- Prediction calculated: {churn_prob:.3f}")
-                    
-                except Exception as e:
-                    st.error(f"Prediction error: {str(e)}")
-                    churn_prob = 0.65  # Fallback prediction
-                
-                st.markdown("### 📊 Risk Assessment Results")
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("Churn Probability", f"{churn_prob:.1%}")
-                
-                with col2:
-                    risk_level = "🔴 HIGH" if churn_prob > 0.7 else "🟡 MEDIUM" if churn_prob > 0.4 else "🟢 LOW"
-                    st.metric("Risk Level", risk_level)
-                
-                with col3:
-                    clv = monthly_charges * tenure
-                    st.metric("Customer Lifetime Value", f"₹{clv:,.0f}")
-                
-                # Recommendations
-                st.subheader("💡 Recommended Actions")
-                
-                if churn_prob > 0.7:
-                    st.error("🚨 **IMMEDIATE INTERVENTION REQUIRED**")
-                    recommendations = [
-                        "📞 Schedule immediate customer retention call",
-                        "💰 Offer personalized discount package (15-20%)",
-                        "🎁 Provide premium service upgrade at no cost",
-                        "📧 Send executive-level attention email",
-                        "⭐ Assign dedicated customer success manager"
-                    ]
-                elif churn_prob > 0.4:
-                    st.warning("⚡ **PROACTIVE ENGAGEMENT RECOMMENDED**")
-                    recommendations = [
-                        "📋 Send customer satisfaction survey",
-                        "🎁 Offer loyalty rewards program enrollment",
-                        "📊 Monitor usage patterns closely",
-                        "💬 Proactive customer service outreach",
-                        "📱 Suggest service optimizations"
-                    ]
+                    customer_data[col] = st.number_input(
+                        f"{col}",
+                        min_value=min_val,
+                        max_value=max_val,
+                        value=mean_val,
+                        key=f"input_{col}"
+                    )
                 else:
-                    st.success("✅ **LOW RISK - MAINTAIN CURRENT STRATEGY**")
-                    recommendations = [
-                        "🌟 Consider for upselling opportunities",
-                        "📝 Use as testimonial/reference customer",
-                        "🎯 Include in referral program",
-                        "📈 Monitor for expansion opportunities",
-                        "💎 Maintain premium service level"
-                    ]
+                    # Categorical input
+                    unique_vals = df[col].unique().tolist()
+                    customer_data[col] = st.selectbox(
+                        f"{col}",
+                        options=unique_vals,
+                        key=f"input_{col}"
+                    )
+            
+            if st.button("🔮 Predict Churn Probability"):
+                churn_prob = st.session_state.predictor.predict_churn(customer_data)
                 
-                for rec in recommendations:
-                    st.write(f"• {rec}")
+                if churn_prob is not None:
+                    st.success("🎯 **Prediction Complete!**")
+                    
+                    # Display results
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric("Churn Probability", f"{churn_prob:.1%}")
+                    
+                    with col2:
+                        risk_level = "🔴 HIGH" if churn_prob > 0.7 else "🟡 MEDIUM" if churn_prob > 0.4 else "🟢 LOW"
+                        st.metric("Risk Level", risk_level)
+                    
+                    with col3:
+                        confidence = "High" if abs(churn_prob - 0.5) > 0.3 else "Medium" if abs(churn_prob - 0.5) > 0.2 else "Low"
+                        st.metric("Confidence", confidence)
+                    
+                    # Recommendations
+                    st.subheader("💡 Recommended Actions")
+                    
+                    if churn_prob > 0.7:
+                        st.error("🚨 **HIGH RISK - Immediate Action Required**")
+                        recommendations = [
+                            "📞 Schedule immediate customer retention call",
+                            "💰 Offer personalized retention package",
+                            "🎁 Provide premium service upgrade",
+                            "📧 Send executive-level attention",
+                            "⭐ Assign dedicated account manager"
+                        ]
+                    elif churn_prob > 0.4:
+                        st.warning("⚡ **MEDIUM RISK - Proactive Engagement**")
+                        recommendations = [
+                            "📋 Send satisfaction survey",
+                            "🎁 Offer loyalty program enrollment",
+                            "📊 Monitor usage patterns",
+                            "💬 Proactive customer service",
+                            "📱 Suggest service optimizations"
+                        ]
+                    else:
+                        st.success("✅ **LOW RISK - Maintain Current Strategy**")
+                        recommendations = [
+                            "🌟 Consider for upselling",
+                            "📝 Use as reference customer",
+                            "🎯 Include in referral program",
+                            "📈 Monitor for expansion",
+                            "💎 Maintain service quality"
+                        ]
+                    
+                    for rec in recommendations:
+                        st.write(f"• {rec}")
     
-    elif page == "📈 Business Intelligence":
-        st.header("📈 Executive Business Intelligence Dashboard")
+    elif page == "📊 Model Analysis":
+        st.header("📊 Model Performance Analysis")
         
-        # Mock business intelligence data
-        col1, col2 = st.columns(2)
+        if not st.session_state.predictor.is_trained:
+            st.warning("⚠️ **Please train models first!**")
+            st.stop()
         
-        with col1:
-            st.subheader("📊 Churn Rate by Segment")
-            segment_data = {
-                'Segment': ['Fiber Optic', 'DSL', 'No Internet', 'Month-to-Month', 'Long-term Contract'],
-                'Churn Rate': [42, 19, 7, 47, 11],
-                'Customer Count': [450, 320, 230, 600, 400]
-            }
+        if hasattr(st.session_state, 'training_results'):
+            results = st.session_state.training_results
             
-            fig = px.bar(segment_data, x='Segment', y='Churn Rate', 
-                        title="Churn Rate by Customer Segment (%)",
-                        color='Churn Rate', color_continuous_scale='reds')
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            st.subheader("💰 Revenue Impact Analysis")
-            months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun']
-            revenue_loss = [2.3, 2.1, 2.7, 3.1, 2.8, 2.5]
-            revenue_saved = [0.8, 1.2, 1.5, 1.8, 2.1, 2.3]
+            # Model comparison
+            st.subheader("🔍 Detailed Model Comparison")
             
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=months, y=revenue_loss, name='Revenue Loss', 
-                                   line=dict(color='red', width=3)))
-            fig.add_trace(go.Scatter(x=months, y=revenue_saved, name='AI-Prevented Loss', 
-                                   line=dict(color='green', width=3)))
-            fig.update_layout(title="Monthly Revenue Impact (₹ Crores)")
+            # Performance metrics
+            metrics_data = []
+            for name, result in results.items():
+                metrics_data.append({
+                    'Model': name,
+                    'AUC Score': result['auc_score'],
+                    'Accuracy': result['accuracy'],
+                    'Precision': result['precision'],
+                    'Recall': result['recall'],
+                    'CV Score': result['cv_score']
+                })
+            
+            metrics_df = pd.DataFrame(metrics_data)
+            
+            # Visualizations
+            fig = px.bar(metrics_df, x='Model', y='AUC Score', 
+                        title="Model Performance Comparison (AUC Score)")
             st.plotly_chart(fig, use_container_width=True)
+            
+            # Feature importance
+            importance_df = st.session_state.predictor.get_feature_importance()
+            if importance_df is not None:
+                st.subheader("🎯 Feature Importance Analysis")
+                
+                fig = px.bar(importance_df.head(15), 
+                           x='importance', y='feature',
+                           orientation='h', 
+                           title="Top 15 Most Important Features")
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # ROC Curve
+            st.subheader("📈 ROC Curve Analysis")
+            
+            best_result = results[st.session_state.predictor.best_model_name]
+            
+            from sklearn.metrics import roc_curve
+            fpr, tpr, _ = roc_curve(best_result['y_test'], best_result['y_pred_proba'])
+            
+            fig = px.line(x=fpr, y=tpr, 
+                         title=f"ROC Curve - {st.session_state.predictor.best_model_name}")
+            fig.add_shape(type='line', x0=0, y0=0, x1=1, y1=1, 
+                         line=dict(dash='dash', color='gray'))
+            fig.update_layout(
+                xaxis_title="False Positive Rate",
+                yaxis_title="True Positive Rate"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    
+    elif page == "💡 How to Use":
+        st.header("💡 How to Use This Churn Predictor")
         
-        # Key insights
-        st.subheader("🔍 Strategic Business Insights")
+        st.markdown("""
+        ## 🎯 What This Tool Does
         
-        insights = [
-            "**🎯 Fiber optic customers** show 2.2x higher churn rate - require targeted retention programs",
-            "**📱 Month-to-month contracts** drive 85% of total churn - incentivize longer commitments",
-            "**💳 Electronic check payment** correlates with 34% higher churn risk",
-            "**🛠️ Customers without tech support** are 67% more likely to churn within 6 months",
-            "**📈 AI prediction accuracy** improved retention rate by 28% over 6 months",
-            "**💰 Average prevention value** per accurately predicted customer: ₹4,850 annually"
-        ]
+        This is a **universal customer churn predictor** that works with ANY business dataset. It uses machine learning to:
+        - Analyze customer behavior patterns
+        - Predict which customers are likely to churn
+        - Provide actionable retention recommendations
         
-        for insight in insights:
-            st.markdown(f"• {insight}")
+        ## 📋 Data Requirements
         
-        # ROI Calculator
-        st.subheader("💼 ROI Calculator")
-        col1, col2, col3 = st.columns(3)
+        Your CSV file should contain:
         
-        with col1:
-            customers_predicted = st.number_input("High-risk customers identified monthly", 100, 1000, 250)
-        with col2:
-            prevention_rate = st.slider("AI prevention success rate (%)", 60, 95, 75)
-        with col3:
-            avg_customer_value = st.number_input("Average monthly customer value (₹)", 1000, 5000, 2500)
+        ### ✅ Required:
+        - **Customer records** (one row per customer)
+        - **Churn indicator** column (Yes/No, 1/0, True/False, etc.)
+        - **Customer features** (demographics, behavior, usage, etc.)
         
-        monthly_savings = customers_predicted * (prevention_rate/100) * avg_customer_value
-        annual_savings = monthly_savings * 12
+        ### 📊 Example Data Structure:
+        ```
+        CustomerID | Age | Tenure | MonthlySpend | ProductsUsed | Churn
+        CUST001    | 34  | 12     | 150.50       | 3            | No
+        CUST002    | 45  | 6      | 89.20        | 1            | Yes
+        CUST003    | 28  | 24     | 220.75       | 5            | No
+        ```
         
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Monthly Savings", f"₹{monthly_savings:,.0f}")
-        with col2:
-            st.metric("Annual Savings", f"₹{annual_savings:,.0f}")
+        ## 🚀 Step-by-Step Process
+        
+        ### 1. **Upload Your Data**
+        - Go to "📤 Upload & Train" tab
+        - Upload your CSV file
+        - System automatically detects churn column
+        
+        ### 2. **Train Models**
+        - Click "🚀 Train Machine Learning Models"
+        - System trains 3 different ML algorithms
+        - Selects best performing model
+        
+        ### 3. **Make Predictions**
+        - Go to "🔮 Predict Churn" tab
+        - Enter customer information
+        - Get instant churn probability
+        
+        ### 4. **Analyze Results**
+        - View model performance metrics
+        - Understand feature importance
+        - Get actionable recommendations
+        
+        ## 🏢 Business Use Cases
+        
+        ### 🏦 **Banking & Finance**
+        - Predict account closures
+        - Identify at-risk credit card customers
+        - Optimize retention campaigns
+        
+        ### 📱 **SaaS & Telecom**
+        - Predict subscription cancellations
+        - Identify service downgrades
+        - Optimize pricing strategies
+        
+        ### 🛒 **E-commerce & Retail**
+        - Predict customer lifetime value
+        - Identify inactive customers
+        - Optimize loyalty programs
+        
+        ### 🏥 **Healthcare & Insurance**
+        - Predict policy cancellations
+        - Identify patient no-shows
+        - Optimize care programs
+        
+        ## 📊 What Makes This Different
+        
+        ### ✅ **Real Machine Learning**
+        - Uses actual trained models (Random Forest, Gradient Boosting, Logistic Regression)
+        - Cross-validation for robust performance
+        - Feature importance analysis
+        
+        ### 🎯 **Universal Compatibility**
+        - Works with any business dataset
+        - Automatic data preprocessing
+        - Handles missing values and categorical data
+        
+        ### 📈 **Actionable Insights**
+        - Risk-based recommendations
+        - Feature importance rankings
+        - Performance metrics and visualizations
+        
+        ## 🔧 Technical Features
+        
+        - **Automatic Data Preprocessing**: Handles missing values, encodes categories
+        - **Model Selection**: Compares multiple algorithms, selects best performer
+        - **Cross-Validation**: Ensures robust, generalizable results
+        - **Feature Engineering**: Automatically optimizes input features
+        - **Interpretability**: Shows what factors drive churn predictions
+        
+        ## 🎯 Get Started Now!
+        
+        1. Prepare your customer data in CSV format
+        2. Upload it using the "📤 Upload & Train" tab
+        3. Train your custom churn prediction model
+        4. Start making predictions and saving customers!
+        
+        ---
+        
+        **💡 Pro Tip**: The more relevant customer features you include, the better your predictions will be!
+        """)
 
 if __name__ == "__main__":
     main()
